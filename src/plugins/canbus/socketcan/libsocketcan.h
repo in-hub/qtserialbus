@@ -1,6 +1,6 @@
 /****************************************************************************
 **
-** Copyright (C) 2017 Andre Hartmann <aha_1980@gmx.de>
+** Copyright (C) 2019 Andre Hartmann <aha_1980@gmx.de>
 ** Contact: http://www.qt.io/licensing/
 **
 ** This file is part of the QtSerialBus module of the Qt Toolkit.
@@ -34,54 +34,43 @@
 **
 ****************************************************************************/
 
-#ifndef SYSTECCANBACKEND_H
-#define SYSTECCANBACKEND_H
+#ifndef LIBSOCKETCAN_H
+#define LIBSOCKETCAN_H
 
-#include <QtSerialBus/qcanbusframe.h>
+#include <QtCore/qglobal.h>
 #include <QtSerialBus/qcanbusdevice.h>
-#include <QtSerialBus/qcanbusdeviceinfo.h>
 
-#include <QtCore/qvariant.h>
-#include <QtCore/qlist.h>
+//
+//  W A R N I N G
+//  -------------
+//
+// This file is not part of the Qt API.  It exists purely as an
+// implementation detail.  This header file may change from version to
+// version without notice, or even be removed.
+//
+// We mean it.
+//
 
 QT_BEGIN_NAMESPACE
 
-class SystecCanBackendPrivate;
+class QString;
 
-class SystecCanBackend : public QCanBusDevice
+class LibSocketCan final
 {
-    Q_OBJECT
-    Q_DECLARE_PRIVATE(SystecCanBackend)
-    Q_DISABLE_COPY(SystecCanBackend)
 public:
-    explicit SystecCanBackend(const QString &name, QObject *parent = nullptr);
-    ~SystecCanBackend();
+    explicit LibSocketCan(QString *errorString = nullptr);
 
-    bool open() override;
-    void close() override;
+    bool start(const QString &interface);
+    bool stop(const QString &interface);
+    bool restart(const QString &interface);
 
-    void setConfigurationParameter(int key, const QVariant &value) override;
+    quint32 bitrate(const QString &interface) const;
+    bool setBitrate(const QString &interface, quint32 bitrate);
 
-    bool writeFrame(const QCanBusFrame &newData) override;
-
-    QString interpretErrorFrame(const QCanBusFrame &errorFrame) override;
-
-    static QList<QCanBusDeviceInfo> interfaces();
-    static bool canCreate(QString *errorReason);
-
-    // This function needs to be public as it is accessed by a callback
-    static QCanBusDeviceInfo createDeviceInfo(const QString &serialNumber,
-                                              const QString &description,
-                                              uint deviceNumber,
-                                              int channelNumber);
-
-private:
-    void resetController();
-    QCanBusDevice::CanBusStatus busStatus();
-
-    SystecCanBackendPrivate * const d_ptr;
+    bool hasBusStatus() const;
+    QCanBusDevice::CanBusStatus busStatus(const QString &interface) const;
 };
 
 QT_END_NAMESPACE
 
-#endif // SYSTECCANBACKEND_H
+#endif // LIBSOCKETCAN_H

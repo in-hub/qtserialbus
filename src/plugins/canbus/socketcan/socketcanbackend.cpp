@@ -36,6 +36,10 @@
 
 #include "socketcanbackend.h"
 
+#include "libsocketcan.h"
+
+#include <QtSerialBus/qcanbusdevice.h>
+
 #include <QtCore/qdatastream.h>
 #include <QtCore/qdebug.h>
 #include <QtCore/qdiriterator.h>
@@ -51,30 +55,6 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
-
-#ifndef CANFD_MTU
-// CAN FD support was added by Linux kernel 3.6
-// For prior kernels we redefine the missing defines here
-// they are taken from linux/can/raw.h & linux/can.h
-
-enum {
-    CAN_RAW_FD_FRAMES = 5
-};
-
-#define CAN_MAX_DLEN 8
-#define CANFD_MAX_DLEN 64
-struct canfd_frame {
-    canid_t can_id;  /* 32 bit CAN_ID + EFF/RTR/ERR flags */
-    __u8    len;     /* frame payload length in byte */
-    __u8    flags;   /* additional flags for CAN FD */
-    __u8    __res0;  /* reserved / padding */
-    __u8    __res1;  /* reserved / padding */
-    __u8    data[CANFD_MAX_DLEN] __attribute__((aligned(8)));
-};
-#define CAN_MTU     (sizeof(struct can_frame))
-#define CANFD_MTU   (sizeof(struct canfd_frame))
-
-#endif
 
 #ifndef CANFD_BRS
 #   define CANFD_BRS 0x01 /* bit rate switch (second bitrate for payload data) */
@@ -182,7 +162,25 @@ QList<QCanBusDeviceInfo> SocketCanBackend::interfaces()
 SocketCanBackend::SocketCanBackend(const QString &name) :
     canSocketName(name)
 {
+    QString errorString;
+    libSocketCan.reset(new LibSocketCan(&errorString));
+    if (Q_UNLIKELY(!errorString.isEmpty())) {
+        qCInfo(QT_CANBUS_PLUGINS_SOCKETCAN,
+               "Cannot load library libsocketcan, some functionality will not be available.\n%ls",
+               qUtf16Printable(errorString));
+    }
+
     resetConfigurations();
+
+    std::function<void()> f = std::bind(&SocketCanBackend::resetController, this);
+    setResetControllerFunction(f);
+
+    if (hasBusStatus()) {
+        // Only register busStatus when libsocketcan is available
+        // QCanBusDevice::hasBusStatus() will return false otherwise
+        std::function<CanBusStatus()> g = std::bind(&SocketCanBackend::busStatus, this);
+        setCanBusStatusGetter(g);
+    }
 }
 
 SocketCanBackend::~SocketCanBackend()
@@ -201,6 +199,8 @@ void SocketCanBackend::resetConfigurations()
                 QVariant::fromValue(QCanBusFrame::FrameErrors(QCanBusFrame::AnyError)));
     QCanBusDevice::setConfigurationParameter(
                 QCanBusDevice::CanFdKey, false);
+    QCanBusDevice::setConfigurationParameter(
+                QCanBusDevice::BitRateKey, 500000);
 }
 
 bool SocketCanBackend::open()
@@ -346,6 +346,12 @@ bool SocketCanBackend::applyConfigurationParameter(int key, const QVariant &valu
         success = true;
         break;
     }
+    case QCanBusDevice::BitRateKey:
+    {
+        const quint32 bitRate = value.toUInt();
+        libSocketCan->setBitrate(canSocketName, bitRate);
+        break;
+    }
     default:
         setError(tr("SocketCanBackend: No such configuration as %1 in SocketCanBackend").arg(key),
                  QCanBusDevice::CanBusError::ConfigurationError);
@@ -359,7 +365,7 @@ bool SocketCanBackend::connectSocket()
 {
     struct ifreq interface;
 
-    if (Q_UNLIKELY((canSocket = socket(PF_CAN, SOCK_RAW | SOCK_NONBLOCK, CAN_RAW)) < 0)) {
+    if (Q_UNLIKELY((canSocket = socket(PF_CAN, SOCK_RAW | SOCK_NONBLOCK, protocol)) < 0)) {
         setError(qt_error_string(errno),
                  QCanBusDevice::CanBusError::ConnectionError);
         return false;
@@ -434,6 +440,16 @@ void SocketCanBackend::setConfigurationParameter(int key, const QVariant &value)
                 return;
             }
         }
+    } else if (key == QCanBusDevice::ProtocolKey) {
+        bool ok = false;
+        const int newProtocol = value.toInt(&ok);
+        if (Q_UNLIKELY(!ok || (newProtocol < 0))) {
+            const QString errorString = tr("Cannot set protocol to value %1.").arg(value.toString());
+            setError(errorString, QCanBusDevice::ConfigurationError);
+            qCWarning(QT_CANBUS_PLUGINS_SOCKETCAN, "%ls", qUtf16Printable(errorString));
+            return;
+        }
+        protocol = newProtocol;
     }
     // connected & params not applyable/invalid
     if (canSocket != -1 && !applyConfigurationParameter(key, value))
@@ -476,8 +492,7 @@ bool SocketCanBackend::writeFrame(const QCanBusFrame &newData)
 
     qint64 bytesWritten = 0;
     if (newData.hasFlexibleDataRateFormat()) {
-        canfd_frame frame;
-        ::memset(&frame, 0, sizeof(frame));
+        canfd_frame frame = {};
         frame.len = newData.payload().size();
         frame.can_id = canId;
         frame.flags = newData.hasBitrateSwitch() ? CANFD_BRS : 0;
@@ -486,8 +501,7 @@ bool SocketCanBackend::writeFrame(const QCanBusFrame &newData)
 
         bytesWritten = ::write(canSocket, &frame, sizeof(frame));
     } else {
-        can_frame frame;
-        ::memset(&frame, 0, sizeof(frame));
+        can_frame frame = {};
         frame.can_dlc = newData.payload().size();
         frame.can_id = canId;
         ::memcpy(frame.data, newData.payload().constData(), frame.can_dlc);
@@ -674,7 +688,7 @@ void SocketCanBackend::readSocket()
     QVector<QCanBusFrame> newFrames;
 
     for (;;) {
-        ::memset(&m_frame, 0, sizeof(m_frame));
+        m_frame = {};
         m_iov.iov_len = sizeof(m_frame);
         m_msg.msg_namelen = sizeof(m_addr);
         m_msg.msg_controllen = sizeof(m_ctrlmsg);
@@ -694,11 +708,11 @@ void SocketCanBackend::readSocket()
             continue;
         }
 
-        struct timeval timeStamp;
+        struct timeval timeStamp = {};
         if (Q_UNLIKELY(ioctl(canSocket, SIOCGSTAMP, &timeStamp) < 0)) {
             setError(qt_error_string(errno),
                      QCanBusDevice::CanBusError::ReadError);
-            ::memset(&timeStamp, 0, sizeof(timeStamp));
+            timeStamp = {};
         }
 
         const QCanBusFrame::TimeStamp stamp(timeStamp.tv_sec, timeStamp.tv_usec);
@@ -729,6 +743,24 @@ void SocketCanBackend::readSocket()
     }
 
     enqueueReceivedFrames(newFrames);
+}
+
+void SocketCanBackend::resetController()
+{
+    libSocketCan->restart(canSocketName);
+}
+
+bool SocketCanBackend::hasBusStatus() const
+{
+    if (isVirtual(canSocketName.toLatin1()))
+        return false;
+
+    return libSocketCan->hasBusStatus();
+}
+
+QCanBusDevice::CanBusStatus SocketCanBackend::busStatus() const
+{
+    return libSocketCan->busStatus(canSocketName);
 }
 
 QT_END_NAMESPACE

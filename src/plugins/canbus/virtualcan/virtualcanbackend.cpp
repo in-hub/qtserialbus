@@ -219,7 +219,7 @@ bool VirtualCanBackend::open()
 
 void VirtualCanBackend::close()
 {
-    setState(ClosingState);
+    qCDebug(QT_CANBUS_PLUGINS_VIRTUALCAN, "Client [%p] sends disconnect to server.", this);
 
     m_clientSocket->write("disconnect:can" + QByteArray::number(m_channel) + '\n');
 }
@@ -290,6 +290,7 @@ bool VirtualCanBackend::writeFrame(const QCanBusFrame &frame)
         enqueueReceivedFrames({echoFrame});
     }
 
+    emit framesWritten(qint64(1));
     return true;
 }
 

@@ -352,8 +352,7 @@ void TinyCanBackendPrivate::startWrite()
     const QCanBusFrame frame = q->dequeueOutgoingFrame();
     const QByteArray payload = frame.payload();
 
-    TCanMsg message;
-    ::memset(&message, 0, sizeof(message));
+    TCanMsg message = {};
 
     if (Q_UNLIKELY(payload.size() > int(sizeof(message.Data.Bytes)))) {
         qCWarning(QT_CANBUS_PLUGINS_TINYCAN, "Cannot write frame with payload size %d.", payload.size());
@@ -389,24 +388,21 @@ void TinyCanBackendPrivate::startRead()
         if (!::CanReceiveGetCount(channelIndex))
             break;
 
-        TCanMsg message;
-        ::memset(&message, 0, sizeof(message));
+        TCanMsg message = {};
 
         const int messagesToRead = 1;
         const int ret = ::CanReceive(channelIndex, &message, messagesToRead);
         if (Q_UNLIKELY(ret < 0)) {
             q->setError(systemErrorString(ret), QCanBusDevice::CanBusError::ReadError);
 
-            TDeviceStatus status;
-            ::memset(&status, 0, sizeof(status));
+            TDeviceStatus status = {};
 
             if (::CanGetDeviceStatus(channelIndex, &status) < 0) {
                 q->setError(systemErrorString(ret), QCanBusDevice::CanBusError::ReadError);
             } else {
                 if (status.CanStatus == CAN_STATUS_BUS_OFF) {
                     qCWarning(QT_CANBUS_PLUGINS_TINYCAN, "CAN bus is in off state, trying to reset the bus.");
-                    if (::CanSetMode(channelIndex, OP_CAN_RESET, CAN_CMD_NONE) < 0)
-                        q->setError(systemErrorString(ret), QCanBusDevice::CanBusError::ReadError);
+                    resetController();
                 }
             }
 
@@ -446,7 +442,8 @@ void TinyCanBackendPrivate::startupDriver()
         ::CanSetEvents(EVENT_ENABLE_RX_MESSAGES);
 
     } else if (Q_UNLIKELY(driverRefCount < 0)) {
-        qCritical("Wrong reference counter: %d", driverRefCount);
+        qCCritical(QT_CANBUS_PLUGINS_TINYCAN, "Wrong driver reference counter: %d",
+                   driverRefCount);
         return;
     }
 
@@ -458,11 +455,24 @@ void TinyCanBackendPrivate::cleanupDriver()
     --driverRefCount;
 
     if (Q_UNLIKELY(driverRefCount < 0)) {
-        qCritical("Wrong reference counter: %d", driverRefCount);
+        qCCritical(QT_CANBUS_PLUGINS_TINYCAN, "Wrong driver reference counter: %d",
+                   driverRefCount);
         driverRefCount = 0;
     } else if (driverRefCount == 0) {
         ::CanSetEvents(EVENT_DISABLE_ALL);
         ::CanDownDriver();
+    }
+}
+
+void TinyCanBackendPrivate::resetController()
+{
+    Q_Q(TinyCanBackend);
+    qint32 ret = ::CanSetMode(channelIndex, OP_CAN_RESET, CAN_CMD_NONE);
+    if (Q_UNLIKELY(ret < 0)) {
+        const QString errorString = systemErrorString(ret);
+        qCWarning(QT_CANBUS_PLUGINS_TINYCAN, "Cannot perform hardware reset: %ls",
+                  qUtf16Printable(errorString));
+        q->setError(errorString, QCanBusDevice::CanBusError::ConfigurationError);
     }
 }
 
@@ -496,6 +506,9 @@ TinyCanBackend::TinyCanBackend(const QString &name, QObject *parent)
 
     d->setupChannel(name);
     d->setupDefaultConfigurations();
+
+    std::function<void()> f = std::bind(&TinyCanBackend::resetController, this);
+    setResetControllerFunction(f);
 }
 
 TinyCanBackend::~TinyCanBackend()
@@ -587,6 +600,12 @@ QString TinyCanBackend::interpretErrorFrame(const QCanBusFrame &errorFrame)
     Q_UNUSED(errorFrame);
 
     return QString();
+}
+
+void TinyCanBackend::resetController()
+{
+    Q_D(TinyCanBackend);
+    d->resetController();
 }
 
 QT_END_NAMESPACE

@@ -114,7 +114,7 @@ QList<QCanBusDeviceInfo> SystecCanBackend::interfaces()
 {
     QList<QCanBusDeviceInfo> result;
 
-    ::UcanEnumerateHardware(&ucanEnumCallback, &result, false, 0, ~0, 0, ~0, 0, ~0);
+    ::UcanEnumerateHardware(&ucanEnumCallback, &result, false, 0, quint8(~0), 0, quint32(~0), 0, quint32(~0));
 
     return result;
 }
@@ -202,8 +202,7 @@ bool SystecCanBackendPrivate::open()
     const int bitrate = q->configurationParameter(QCanBusDevice::BitRateKey).toInt();
     const bool receiveOwn = q->configurationParameter(QCanBusDevice::ReceiveOwnKey).toBool();
 
-    tUcanInitCanParam param;
-    ::memset(&param, 0, sizeof(param));
+    tUcanInitCanParam param = {};
     param.m_dwSize = sizeof(param);
     param.m_bMode  = receiveOwn ? kUcanModeTxEcho : kUcanModeNormal;
     param.m_bOCR   = USBCAN_OCR_DEFAULT;
@@ -281,8 +280,8 @@ bool SystecCanBackendPrivate::setupChannel(const QString &interfaceName)
     const QRegularExpressionMatch match = re.match(interfaceName);
 
     if (Q_LIKELY(match.hasMatch())) {
-        device = match.captured(1).toInt();
-        channel = match.captured(2).toInt();
+        device = quint8(match.captured(1).toUShort());
+        channel = quint8(match.captured(2).toUShort());
     } else {
         q->setError(SystecCanBackend::tr("Invalid interface '%1'.")
                     .arg(interfaceName), QCanBusDevice::ConnectionError);
@@ -373,11 +372,10 @@ void SystecCanBackendPrivate::startWrite()
     const QCanBusFrame frame = q->dequeueOutgoingFrame();
     const QByteArray payload = frame.payload();
 
-    tCanMsgStruct message;
-    ::memset(&message, 0, sizeof(message));
+    tCanMsgStruct message = {};
 
     message.m_dwID = frame.frameId();
-    message.m_bDLC = payload.size();
+    message.m_bDLC = quint8(payload.size());
 
     message.m_bFF = frame.hasExtendedFrameFormat() ? USBCAN_MSG_FF_EXT : USBCAN_MSG_FF_STD;
 
@@ -403,8 +401,7 @@ void SystecCanBackendPrivate::readAllReceivedMessages()
     QVector<QCanBusFrame> newFrames;
 
     for (;;) {
-        tCanMsgStruct message;
-        ::memset(&message, 0, sizeof(message));
+        tCanMsgStruct message = {};
 
         const UCANRET result = ::UcanReadCanMsgEx(handle, &channel, &message, nullptr);
         if (result == USBCAN_WARN_NODATA)
@@ -454,6 +451,39 @@ bool SystecCanBackendPrivate::verifyBitRate(int bitrate)
     return true;
 }
 
+void SystecCanBackendPrivate::resetController()
+{
+    ::UcanResetCan(handle);
+}
+
+QCanBusDevice::CanBusStatus SystecCanBackendPrivate::busStatus()
+{
+    Q_Q(SystecCanBackend);
+
+    tStatusStruct status = {};
+    const UCANRET result = ::UcanGetStatus(handle, &status);
+
+    if (Q_UNLIKELY(result != USBCAN_SUCCESSFUL)) {
+        qCWarning(QT_CANBUS_PLUGINS_SYSTECCAN, "Can not query CAN bus status.");
+        q->setError(SystecCanBackend::tr("Can not query CAN bus status."), QCanBusDevice::ConfigurationError);
+        return QCanBusDevice::CanBusStatus::Unknown;
+    }
+
+    if (status.m_wCanStatus & USBCAN_CANERR_BUSOFF)
+        return QCanBusDevice::CanBusStatus::BusOff;
+
+    if (status.m_wCanStatus & USBCAN_CANERR_BUSHEAVY)
+        return QCanBusDevice::CanBusStatus::Error;
+
+    if (status.m_wCanStatus & USBCAN_CANERR_BUSLIGHT)
+        return QCanBusDevice::CanBusStatus::Warning;
+
+    if (status.m_wCanStatus == USBCAN_CANERR_OK)
+        return QCanBusDevice::CanBusStatus::Good;
+
+    return QCanBusDevice::CanBusStatus::Unknown;
+}
+
 SystecCanBackend::SystecCanBackend(const QString &name, QObject *parent) :
     QCanBusDevice(parent),
     d_ptr(new SystecCanBackendPrivate(this))
@@ -462,6 +492,12 @@ SystecCanBackend::SystecCanBackend(const QString &name, QObject *parent) :
 
     d->setupChannel(name);
     d->setupDefaultConfigurations();
+
+    std::function<void()> f = std::bind(&SystecCanBackend::resetController, this);
+    setResetControllerFunction(f);
+
+    std::function<CanBusStatus()> g = std::bind(&SystecCanBackend::busStatus, this);
+    setCanBusStatusGetter(g);
 }
 
 SystecCanBackend::~SystecCanBackend()
@@ -551,6 +587,19 @@ QString SystecCanBackend::interpretErrorFrame(const QCanBusFrame &errorFrame)
     Q_UNUSED(errorFrame);
 
     return QString();
+}
+
+void SystecCanBackend::resetController()
+{
+    Q_D(SystecCanBackend);
+    d->resetController();
+}
+
+QCanBusDevice::CanBusStatus SystecCanBackend::busStatus()
+{
+    Q_D(SystecCanBackend);
+
+    return d->busStatus();
 }
 
 QT_END_NAMESPACE
